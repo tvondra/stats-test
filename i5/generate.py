@@ -1,22 +1,24 @@
 #!/usr/bin/python3.9
 
 import psycopg2
+import psycopg2.extras
 import itertools
 import re
 import random
+import json
 
 from multiprocessing import Queue, Process
 
 sample_rate = 0.05
 conn_string = 'host=localhost dbname=test user=postgres'
-nconsumers = 16
-nrows = 1000000
+nconsumers = 1
+nrows = 100000
 
 def prepare_schema(conn, correlated = False, values = 10, stats_target = 100):
 
-	with conn.cursor() as cur:
+	with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
 
-		# 
+		# recreate the tables
 		cur.execute('drop table if exists data_no_stats')
 		cur.execute('drop table if exists data_with_stats')
 
@@ -24,17 +26,30 @@ def prepare_schema(conn, correlated = False, values = 10, stats_target = 100):
 		cur.execute('create table data_with_stats (a int, b int, c int, d int)')
 		cur.execute('create statistics s on a, b, c, d from data_with_stats')
 
+		cur.execute('select setseed(0)')
+
+		# generate the data set
 		if correlated:
+			ds = 'correlated'
 			cur.execute('with d as (select random() as r from generate_series(1,%(rows)s)) insert into data_no_stats select %(values)s * r, %(values)s * pow(r,2), %(values)s * pow(r,3), %(values)s * pow(r,3) from d' % {'values' : values, 'rows' : nrows})
 		else:
+			ds = 'random'
 			cur.execute('insert into data_no_stats select %(values)s * random(), %(values)s * pow(random(),2), %(values)s * pow(random(),3), %(values)s * pow(random(),3) from generate_series(1,%(rows)s)' % {'values' : values, 'rows' : nrows})
 
 		cur.execute('insert into data_with_stats select * from data_no_stats')
 
-		#
+		# build statistics
 		cur.execute('set default_statistics_target = %d' % (stats_target,))
 		cur.execute('analyze data_no_stats')
 		cur.execute('analyze data_with_stats')
+
+		cur.execute('select * from pg_stats_ext')
+
+		res = cur.fetchall()
+
+		with open('%s-%s-%s.stats' % (ds, stats_target, values), 'w') as f:
+			for r in res:
+				f.write(json.dumps(r, indent=True))
 
 
 def format_query(ops, vars_cnt, vars, vals, cons, para_location):
@@ -100,6 +115,27 @@ def explain_query(conn, table, ops, vars_cnt, vars, vals, cons, para_location):
 		return (float(g[0]),)
 
 
+def dump_explains(conn, ds, values, target, seed, tables, query):
+
+	explain = ''
+
+	for t in tables:
+
+		explain += ("---------- seed: %s  ds: %s  values: %s  target: %s  clauses: %s ---------\n" % (seed, ds, values, target, query))
+
+		sql = 'explain select * from ' + t + ' where ' + query
+
+		with conn.cursor() as cur:
+			cur.execute(sql)
+
+			x = cur.fetchall()
+
+			for r in x:
+				explain += ("%s\n" % (r[0],))
+
+	return explain
+
+
 def query_generator(worker_id, queue, nconsumers, correlated, stats_target, values, columns = ['a', 'b', 'c', 'd'], operators = ['<', '>', '=', '<=', '>=', '!='], conditions = ['and', 'or']):
 
 	nquery = 0
@@ -113,8 +149,24 @@ def query_generator(worker_id, queue, nconsumers, correlated, stats_target, valu
 			# each operator has either one or two vars
 			for vars_cnt in itertools.combinations_with_replacement([1, 2], nclauses):
 
-				# generate enough vars for the clauses
-				for vars in itertools.combinations_with_replacement(columns, sum(vars_cnt)):
+				# generate enough vars for the clauses - we do that in two steps - first one
+				# var per clause, then extra vars for the clauses with two vars
+				for vars_tmp in itertools.combinations_with_replacement(columns, nclauses):
+
+					vars = []
+
+					random.seed(nquery)
+
+					for i in range(0, nclauses):
+
+						vars.append(vars_tmp[i])
+
+						if vars_cnt[i] == 2:
+							while True:
+								var = random.choice(columns)
+								if var != vars_tmp[i]:
+									vars.append(var)
+									break
 
 					# decide how to combine the clauses
 					for cons in itertools.combinations_with_replacement(conditions, nclauses - 1):
@@ -177,24 +229,29 @@ def query_executor(worker_id, input_queue, result_queue):
 
 		query = format_query(ops, vars_cnt, vars, rand_vals, cons, para_location)
 
+		explain = dump_explains(conn, c, values, stats_target, seed, ['data_no_stats', 'data_with_stats'], query)
+
 		res = ('%s	%s	%d	%d	%d	%d	"%s"	%d	%d	%d	%f	%f' % (c, worker_id, seed, nqueries, stats_target, values, query, int(actual), int(estimate1), int(estimate2), round(error1, 3), round(error2, 3)))
 
-		result_queue.put(res)
+		result_queue.put({'result' : res, 'explain' : explain})
 
 
 def result_printer(worker_id, result_queue, nproducers):
 
-	while True:
+	with open('explains.log', 'a') as f:
 
-		r = result_queue.get()
+		while True:
 
-		if not r:
-			nproducers -= 1
-		else:
-			print (r)
+			r = result_queue.get()
 
-		if nproducers == 0:
-			return
+			if not r:
+				nproducers -= 1
+			else:
+				print (r['result'])
+				f.write(r['explain'])
+
+			if nproducers == 0:
+				return
 
 
 if __name__ == '__main__':
