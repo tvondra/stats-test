@@ -11,9 +11,6 @@ for d in random correlated; do
 
 			gnuplot $d-$t-$v.plot
 
-			convert -alpha remove -alpha off -density 150 $d-$t-$v.eps $d-$t-$v.png
-			# exit
-
 		done
 
 	done

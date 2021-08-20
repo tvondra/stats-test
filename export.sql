@@ -4,14 +4,13 @@ select
   target,
   values,
   seed,
-  -- master
+  -- no stats
   m.estimate_no_stats / greatest(m.actual, 1.0) as m_error_no_stats,
-  m.estimate_with_stats / greatest(m.actual, 1.0) as m_error_with_stats,
-  -- patched
   p.estimate_no_stats / greatest(p.actual, 1.0) as p_error_no_stats,
-  p.estimate_with_stats / greatest(p.actual, 1.0) as p_error_with_stats,
-  -- patched + fix
   f.estimate_no_stats / greatest(f.actual, 1.0) as f_error_no_stats,
+  -- with stats
+  m.estimate_with_stats / greatest(m.actual, 1.0) as m_error_with_stats,
+  p.estimate_with_stats / greatest(p.actual, 1.0) as p_error_with_stats,
   f.estimate_with_stats / greatest(f.actual, 1.0) as f_error_with_stats,
   -- raw data
   m.actual::int as m_actual,
